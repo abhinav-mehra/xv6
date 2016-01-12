@@ -45,6 +45,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->type = PROCESS; 
   release(&ptable.lock);
 
   // Allocate kernel stack if possible.
@@ -107,6 +108,7 @@ int
 growproc(int n)
 {
   uint sz;
+  struct proc *p;
   
   sz = proc->sz;
   if(n > 0){
@@ -117,6 +119,14 @@ growproc(int n)
       return -1;
   }
   proc->sz = sz;
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->pgdir != proc->pgdir)
+      continue;
+      p->sz = sz;
+  }
+  release(&ptable.lock);
+
   switchuvm(proc);
   return 0;
 }
@@ -157,6 +167,119 @@ fork(void)
   np->state = RUNNABLE;
   safestrcpy(np->name, proc->name, sizeof(proc->name));
   return pid;
+}
+
+// Create a new process copying p as the parent.
+// Sets up stack to return as if from system call.
+// Caller must set state of returned proc to RUNNABLE.
+int
+clone(void(*fcn)(void*), void *arg, void *stack)
+{
+  int i, pid;
+  struct proc *np;
+  uint retaddress;
+  uint sp;
+
+  if((((int) stack) % PGSIZE) != 0)
+    return -1;
+  if((proc->sz - ((int) stack)) < PGSIZE)
+    return -1;
+  // Allocate process.
+  if((np = allocproc()) == 0)
+    return -1;
+
+  /* Copy process state from p.
+  if((np->pgdir = copyuvm(proc->pgdir, proc->sz)) == 0){
+    kfree(np->kstack);
+    np->kstack = 0;
+    np->state = UNUSED;
+    return -1;
+  }
+  */
+  np->pgdir = proc->pgdir;
+  np->sz = proc->sz;
+  np->parent = proc;
+  *np->tf = *proc->tf;
+  np->type = THREAD; 
+  // Clear %eax so that fork returns 0 in the child.
+  np->tf->eax = 0;
+
+  for(i = 0; i < NOFILE; i++)
+    if(proc->ofile[i])
+      np->ofile[i] = filedup(proc->ofile[i]);
+  np->cwd = idup(proc->cwd);
+ 
+  pid = np->pid;
+  safestrcpy(np->name, proc->name, sizeof(proc->name));
+
+
+  // Push argument strings, prepare rest of stack in ustack.
+  sp = (uint)(stack + PGSIZE);
+
+  sp -= sizeof(arg);
+  sp &= ~3;
+  memmove((void *)sp, (void *)&arg, sizeof(arg));
+
+  retaddress = 0xffffffff;  // fake return PC
+
+  sp -= 4;
+  memmove((void *)sp, (void *)&retaddress, sizeof(retaddress));
+  //*sp = retaddress;
+
+  // Commit to the user image.
+  np->tf->eip = (int) fcn;
+  np->tf->esp = sp;
+  np->sp = (int)stack;
+  np->state = RUNNABLE;
+  //DEBUG
+  //cprintf("clone esp %d sp %d stack %d\n", np->tf->esp, sp, (int) stack);
+  return pid;
+}
+
+// Wait for a child thread to exit and return its pid and stack.
+// Return -1 if this process has no children.
+int
+join(void **stack)
+{
+  struct proc *p;
+  int havekids, pid;
+
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for zombie children.
+    havekids = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if((p->parent != proc) || (p->type != THREAD))
+        continue;
+      havekids = 1;
+      if(p->state == ZOMBIE){
+        // Found one.
+        pid = p->pid;
+        kfree(p->kstack);
+        p->kstack = 0;
+        //freevm(p->pgdir);
+        p->state = UNUSED;
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        *stack = (void *)p->sp;
+	//DEBUG
+	//cprintf("stack %d %d\n", (int) *stack, p->tf->esp);
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || proc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(proc, &ptable.lock);  //DOC: wait-sleep
+  }
 }
 
 // Exit the current process.  Does not return.
@@ -215,7 +338,7 @@ wait(void)
     // Scan through table looking for zombie children.
     havekids = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->parent != proc)
+      if((p->parent != proc)|| (p->type != PROCESS))
         continue;
       havekids = 1;
       if(p->state == ZOMBIE){

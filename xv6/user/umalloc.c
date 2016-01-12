@@ -20,10 +20,12 @@ typedef union header Header;
 
 static Header base;
 static Header *freep;
+static lock_t memlck;
 
 void
-free(void *ap)
+sfree(void *ap)
 {
+  
   Header *bp, *p;
 
   bp = (Header*)ap - 1;
@@ -43,6 +45,14 @@ free(void *ap)
   freep = p;
 }
 
+void
+free(void *ap)
+{
+  lock_acquire(&memlck);
+  sfree(ap);
+  lock_release(&memlck);
+}
+
 static Header*
 morecore(uint nu)
 {
@@ -56,12 +66,13 @@ morecore(uint nu)
     return 0;
   hp = (Header*)p;
   hp->s.size = nu;
-  free((void*)(hp + 1));
+  sfree((void*)(hp + 1));
   return freep;
 }
 
+
 void*
-malloc(uint nbytes)
+smalloc(uint nbytes)
 {
   Header *p, *prevp;
   uint nunits;
@@ -88,3 +99,14 @@ malloc(uint nbytes)
         return 0;
   }
 }
+
+void*
+malloc(uint nbytes)
+{
+  void *ret;
+  lock_acquire(&memlck);
+  ret = smalloc(nbytes);
+  lock_release(&memlck);
+  return ret;
+}
+  
